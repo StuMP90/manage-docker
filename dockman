@@ -1,0 +1,1802 @@
+#!/usr/bin/env python3
+"""dockman - interactive terminal manager for Docker containers.
+
+Install it on the server and run it there: it drives the ordinary `docker` CLI,
+so no agent or management container is needed. Python 3.8+ standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import locale
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+
+# Lists every container and inspects them all in one round trip.
+LIST_SCRIPT = 'ids=$(docker ps -aq) || exit 1; if [ -n "$ids" ]; then docker inspect $ids; else echo "[]"; fi'
+SHELL_PICKER = "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
+
+COMPOSE_TEMPLATE = """\
+# Compose file for {name}.  Reference: https://docs.docker.com/reference/compose-file/
+services:
+  {name}:
+    image: nginx:alpine          # change me
+    container_name: {name}
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    # volumes:
+    #   - ./data:/data
+    # environment:
+    #   - TZ=Europe/London
+"""
+
+
+def q(s):
+    return shlex.quote(str(s))
+
+
+def trunc(s, n):
+    s = str(s)
+    if n <= 0 or len(s) <= n:
+        return s if n > 0 else ""
+    return s[: n - 1] + "…"
+
+
+def parse_ts(s):
+    """Parse Docker's RFC3339Nano timestamps (portable to Python 3.8)."""
+    if not s or s.startswith("0001-"):
+        return None
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)?", s)
+    if not m:
+        return None
+    frac = "." + (m.group(2) or ".")[1:].ljust(6, "0")[:6]
+    tz = m.group(3) or "Z"
+    try:
+        return datetime.fromisoformat(m.group(1) + frac + ("+00:00" if tz == "Z" else tz))
+    except ValueError:
+        return None
+
+
+def ago(dt):
+    if not dt:
+        return "?"
+    s = int((datetime.now(timezone.utc) - dt).total_seconds())
+    for n, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if s >= n:
+            return "%d%s" % (s // n, unit)
+    return "%ds" % max(s, 0)
+
+
+def json_lines(text):
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+    return out
+
+
+def parse_container(d):
+    st = d.get("State") or {}
+    cfg = d.get("Config") or {}
+    hc = d.get("HostConfig") or {}
+    labels = cfg.get("Labels") or {}
+    rp = hc.get("RestartPolicy") or {}
+
+    ports = []
+    for cport, binds in sorted(((d.get("NetworkSettings") or {}).get("Ports") or {}).items()):
+        for hp in sorted({b.get("HostPort") for b in binds or [] if b.get("HostPort")}):
+            ports.append("%s->%s" % (hp, cport.replace("/tcp", "")))
+
+    state = st.get("Status", "?")
+    health = (st.get("Health") or {}).get("Status", "")
+    if state == "running":
+        status = "Up " + ago(parse_ts(st.get("StartedAt")))
+    elif state == "exited":
+        status = "Exited(%s) %s ago" % (st.get("ExitCode"), ago(parse_ts(st.get("FinishedAt"))))
+    elif state == "restarting":
+        status = "Restarting (exit %s)" % st.get("ExitCode")
+    else:
+        status = state.capitalize()
+    if health and state == "running":
+        status += " (%s)" % health
+
+    policy = rp.get("Name") or "no"
+    if policy == "on-failure" and rp.get("MaximumRetryCount"):
+        policy += ":%d" % rp["MaximumRetryCount"]
+
+    return {
+        "id": d.get("Id", "")[:12],
+        "name": d.get("Name", "").lstrip("/"),
+        "image": cfg.get("Image", ""),
+        "image_id": d.get("Image", ""),
+        "state": state,
+        "health": health,
+        "exit_code": st.get("ExitCode", 0),
+        "status": status,
+        "restart": policy,
+        "restart_count": d.get("RestartCount", 0),
+        "ports": ports,
+        "project": labels.get("com.docker.compose.project", ""),
+        "service": labels.get("com.docker.compose.service", ""),
+        "wd": labels.get("com.docker.compose.project.working_dir", ""),
+        "files": [f for f in labels.get("com.docker.compose.project.config_files", "").split(",") if f],
+        "raw": d,
+    }
+
+
+# ------------------------------------------------------------- container specs
+# A "spec" is a plain dict describing a container; it can be rendered as a
+# `docker run` command or as a compose file.
+
+def spec_from_inspect(d, img_cfg):
+    cfg = d.get("Config") or {}
+    hc = d.get("HostConfig") or {}
+    rp = hc.get("RestartPolicy") or {}
+    restart = rp.get("Name") or "no"
+    if restart == "on-failure" and rp.get("MaximumRetryCount"):
+        restart += ":%d" % rp["MaximumRetryCount"]
+
+    ports = []
+    for cport, binds in sorted((hc.get("PortBindings") or {}).items()):
+        cp = cport[:-4] if cport.endswith("/tcp") else cport
+        for b in binds or [{}]:
+            ip, hp = b.get("HostIp") or "", b.get("HostPort") or ""
+            ports.append(((ip + ":") if ip else "") + ((hp + ":") if hp else "") + cp)
+
+    volumes = []
+    for m in d.get("Mounts") or []:
+        ro = "" if m.get("RW", True) else ":ro"
+        if m.get("Type") == "bind":
+            volumes.append("%s:%s%s" % (m.get("Source"), m.get("Destination"), ro))
+        elif m.get("Type") == "volume" and not re.fullmatch(r"[0-9a-f]{64}", m.get("Name", "")):
+            volumes.append("%s:%s%s" % (m.get("Name"), m.get("Destination"), ro))
+
+    img_env = set(img_cfg.get("Env") or [])
+    net = hc.get("NetworkMode") or ""
+    entry = cfg.get("Entrypoint")
+    cmd = cfg.get("Cmd")
+    return {
+        "name": d.get("Name", "").lstrip("/"),
+        "service": (cfg.get("Labels") or {}).get("com.docker.compose.service", ""),
+        "image": cfg.get("Image", ""),
+        "restart": restart,
+        "ports": ports,
+        "volumes": volumes,
+        "env": [e for e in cfg.get("Env") or [] if e not in img_env],
+        "network": "" if net in ("default", "bridge") or net.startswith("container:") else net,
+        "privileged": bool(hc.get("Privileged")),
+        "cap_add": hc.get("CapAdd") or [],
+        "devices": ["%s:%s" % (x.get("PathOnHost"), x.get("PathInContainer")) for x in hc.get("Devices") or []],
+        "extra_hosts": hc.get("ExtraHosts") or [],
+        "entrypoint": entry if entry and entry != img_cfg.get("Entrypoint") else None,
+        "command": cmd if cmd and cmd != img_cfg.get("Cmd") else [],
+        "extra": [],
+    }
+
+
+def spec_run_groups(sp):
+    """`docker run` argv as groups of tokens (one group per display line)."""
+    g = [["docker", "run", "-d"]]
+    if sp.get("name"):
+        g.append(["--name", sp["name"]])
+    if sp.get("restart") and sp["restart"] != "no":
+        g.append(["--restart", sp["restart"]])
+    for flag, key in (("-p", "ports"), ("-v", "volumes"), ("-e", "env"), ("--cap-add", "cap_add"),
+                      ("--device", "devices"), ("--add-host", "extra_hosts")):
+        for v in sp.get(key) or []:
+            g.append([flag, v])
+    if sp.get("network"):
+        g.append(["--network", sp["network"]])
+    if sp.get("privileged"):
+        g.append(["--privileged"])
+    cmd = list(sp.get("command") or [])
+    if sp.get("entrypoint"):
+        g.append(["--entrypoint", sp["entrypoint"][0]])
+        cmd = list(sp["entrypoint"][1:]) + cmd
+    if sp.get("extra"):
+        g.append(list(sp["extra"]))
+    g.append([sp["image"]] + cmd)
+    return g
+
+
+def spec_run_argv(sp):
+    return [t for grp in spec_run_groups(sp) for t in grp]
+
+
+def spec_run_text(sp):
+    return " \\\n    ".join(shlex.join(grp) for grp in spec_run_groups(sp))
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9_-]+", "-", s.lower()).strip("-_") or "app"
+
+
+def spec_compose(sp):
+    def y(s):  # JSON strings are valid YAML; `$` must be doubled for compose
+        return json.dumps(str(s).replace("$", "$$"))
+
+    svc = slug(sp.get("service") or sp.get("name") or sp["image"].split("/")[-1].split(":")[0])
+    out = ["services:", "  %s:" % svc, "    image: %s" % y(sp["image"])]
+    if sp.get("name"):
+        out.append("    container_name: %s" % y(sp["name"]))
+    if sp.get("restart") and sp["restart"] != "no":
+        out.append("    restart: %s" % sp["restart"])
+    net = sp.get("network") or ""
+    if net == "host":
+        out.append("    network_mode: host")
+    for key in ("ports", "volumes", "env", "cap_add", "devices", "extra_hosts"):
+        items = sp.get(key) or []
+        if items:
+            out.append("    %s:" % ("environment" if key == "env" else key))
+            out += ["      - %s" % y(v) for v in items]
+    if sp.get("privileged"):
+        out.append("    privileged: true")
+    if sp.get("entrypoint"):
+        out.append("    entrypoint: [%s]" % ", ".join(y(v) for v in sp["entrypoint"]))
+    if sp.get("command"):
+        out.append("    command: [%s]" % ", ".join(y(v) for v in sp["command"]))
+    if net and net not in ("host", "none"):
+        out += ["    networks:", "      - %s" % y(net), "networks:", "  %s:" % y(net), "    external: true"]
+    # Named volumes must be declared; `name:` keeps the exact name, so existing data is reused.
+    named = sorted({v.split(":")[0] for v in sp.get("volumes") or []
+                    if not v.startswith(("/", ".", "~")) and ":" in v})
+    if named:
+        out.append("volumes:")
+        for v in named:
+            out += ["  %s:" % y(v), "    name: %s" % y(v)]
+    if sp.get("extra"):
+        out.insert(0, "# NOT converted (add by hand): %s" % shlex.join(sp["extra"]))
+    return "\n".join(out) + "\n"
+
+
+# ------------------------------------------------------------------ host access
+
+class Host:
+    """Runs commands on this machine."""
+
+    def __init__(self):
+        self.label = socket.gethostname()
+
+    @staticmethod
+    def _argv(cmd):
+        return cmd if isinstance(cmd, list) else ["sh", "-c", cmd]
+
+    def run(self, cmd, input=None, timeout=60):
+        """Run a command (argv list, or shell script string); return (rc, stdout, stderr)."""
+        kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+        try:
+            p = subprocess.run(self._argv(cmd), capture_output=True, text=True,
+                               errors="replace", timeout=timeout, **kw)
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", "timed out after %ss" % timeout
+        except OSError as e:
+            return 127, "", str(e)
+
+    def interactive(self, cmd):
+        """Run attached to the terminal. Ctrl-C goes to the command, not to us."""
+        p = subprocess.Popen(self._argv(cmd))
+        while True:
+            try:
+                return p.wait()
+            except KeyboardInterrupt:
+                continue
+
+    def write_file(self, path, content):
+        return self.run("mkdir -p %s && cat > %s" % (q(os.path.dirname(path) or "."), q(path)), input=content)
+
+
+# --------------------------------------------------------- plain-terminal input
+
+class Cancel(Exception):
+    pass
+
+
+def ask(label, default="", required=False):
+    while True:
+        try:
+            s = input("%s%s: " % (label, " [%s]" % default if default else "")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise Cancel()
+        s = s or default
+        if s or not required:
+            return s
+
+
+def ask_yn(label, default=True):
+    s = ask(label + (" [Y/n]" if default else " [y/N]")).lower()
+    return default if not s else s.startswith("y")
+
+
+def ask_list(label, items):
+    items = list(items)
+    print(label + ":")
+
+    def show():
+        for i, it in enumerate(items, 1):
+            print("    %d. %s" % (i, it))
+    show()
+    while True:
+        s = ask("  add one (blank = done, -N removes #N)")
+        if not s:
+            return items
+        if re.fullmatch(r"-\d+", s):
+            n = int(s[1:])
+            if 1 <= n <= len(items):
+                items.pop(n - 1)
+            show()
+        else:
+            items.append(s)
+
+
+def read_pasted(prompt):
+    print(prompt + "\n(finish with a line containing only EOF, or Ctrl-D)")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            print()
+            raise Cancel()
+        if line.strip() == "EOF":
+            break
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def edit_text(text, suffix=".yaml"):
+    """Edit text in the local $VISUAL/$EDITOR. Returns None if no editor is available."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or next(
+        (e for e in ("nano", "vim", "vi") if shutil.which(e)), None)
+    if not editor:
+        return None
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="dockman-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        subprocess.call(shlex.split(editor) + [path])
+        with open(path) as f:
+            return f.read()
+    finally:
+        os.unlink(path)
+
+
+def pause():
+    try:
+        input("\n[Enter] to return ")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+# ------------------------------------------------------------------- key tables
+
+CONTAINER_ACTIONS = [
+    ("s", "Start / unpause", "start"),
+    ("x", "Stop", "stop"),
+    ("X", "Stop and disable auto-restart", "stop_hard"),
+    ("r", "Restart", "restart"),
+    ("p", "Pause / unpause", "pause"),
+    ("K", "Kill (SIGKILL)", "kill"),
+    ("d", "Remove…", "remove"),
+    None,
+    ("l", "Logs (last 5000 lines)", "logs"),
+    ("L", "Logs: since / tail / search…", "logs_opts"),
+    ("f", "Follow logs live", "follow"),
+    ("e", "Shell inside container", "shell"),
+    ("!", "Run a command inside container…", "exec_cmd"),
+    ("i", "Info summary", "info"),
+    ("I", "Inspect (raw JSON)", "inspect"),
+    ("t", "Processes (top)", "top"),
+    ("S", "Live resource stats", "live_stats"),
+    None,
+    ("u", "Set restart policy…", "policy"),
+    ("n", "Rename…", "rename"),
+    ("E", "Export as docker run / compose", "export"),
+    ("U", "Update image & recreate (compose)", "update"),
+    ("c", "Compose project actions…", "compose_sel"),
+]
+
+GLOBAL_ACTIONS = [
+    ("a", "Add a container or compose project…", "add"),
+    ("P", "Compose projects…", "projects"),
+    ("D", "Disk usage & pruning…", "disk"),
+    ("m", "Images, volumes, networks, prune, events…", "manage"),
+    ("/", "Filter list", "filter"),
+    ("A", "Toggle all / running only", "toggle_all"),
+    ("R", "Refresh now", "refresh"),
+    ("?", "Help", "help"),
+    ("q", "Quit", "quit"),
+]
+
+HINTS = ("Enter menu  s start  x stop  r restart  l logs  f follow  e shell  a add  P compose  D disk  "
+         "m manage  / filter  ? help  q quit")
+
+
+# --------------------------------------------------------------------- the app
+
+class App:
+    def __init__(self, host, compose_cmd):
+        self.host = host
+        self.compose = compose_cmd
+        self.containers = []
+        self.stats = {}
+        self.loaded = False
+        self.error = ""
+        self.sel_id = None
+        self.top = 0
+        self.filter = ""
+        self.show_all = True
+        self.busy = {}
+        self.msg, self.msg_err, self.msg_t = "", False, 0.0
+        self.stop_ev = threading.Event()
+        self.wake = threading.Event()
+        self.scr = None
+        self.draw_fn = self.draw_main
+        self._home = None
+
+    # ---- background polling
+    def poll_containers(self):
+        while not self.stop_ev.is_set():
+            rc, out, err = self.host.run(LIST_SCRIPT, timeout=30)
+            try:
+                data = json.loads(out) if out.strip() else None
+            except ValueError:
+                data = None
+            if data is None:
+                self.error = ((err or out).strip().splitlines() or ["docker ps failed"])[-1]
+            else:
+                self.containers = sorted((parse_container(d) for d in data),
+                                         key=lambda c: (c["project"].lower(), c["name"].lower()))
+                self.error = ""
+                self.loaded = True
+            self.wake.wait(3)
+            self.wake.clear()
+
+    def poll_stats(self):
+        while not self.stop_ev.is_set():
+            if any(c["state"] == "running" for c in self.containers):
+                rc, out, _ = self.host.run(["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout=30)
+                if rc == 0:
+                    self.stats = {s.get("ID", "")[:12]: s for s in json_lines(out)}
+            self.stop_ev.wait(4)
+
+    # ---- small helpers
+    def flash(self, msg, err=False):
+        self.msg, self.msg_err, self.msg_t = msg, err, time.time()
+
+    def refresh_soon(self):
+        self.wake.set()
+
+    def home(self):
+        if self._home is None:
+            rc, out, _ = self.host.run('printf %s "$HOME"')
+            self._home = out.strip() or "/root"
+        return self._home
+
+    def expand(self, path):
+        return self.home() + path[1:] if path == "~" or path.startswith("~/") else path
+
+    def bg(self, c, verb, cmd):
+        """Run a quick docker command in the background, showing progress in the list."""
+        name = c["name"]
+        self.busy[c["id"]] = verb + "…"
+
+        def work():
+            rc, out, err = self.host.run(cmd, timeout=180)
+            if rc == 0:
+                self.flash("%s %s: done" % (verb, name))
+            else:
+                self.flash("%s %s failed: %s" % (verb, name, ((err or out).strip().splitlines() or ["?"])[-1]),
+                           err=True)
+            self.busy.pop(c["id"], None)
+            self.refresh_soon()
+        threading.Thread(target=work, daemon=True).start()
+
+    def capture(self, cmd, timeout=60):
+        """Run and return combined output, flashing an error on failure (None)."""
+        rc, out, err = self.host.run(cmd, timeout=timeout)
+        if rc != 0:
+            self.flash(((err or out).strip().splitlines() or ["command failed (%d)" % rc])[-1], err=True)
+            return None
+        return out
+
+    @contextmanager
+    def suspended(self):
+        """Leave curses temporarily to use the plain terminal."""
+        curses.endwin()
+        try:
+            yield
+        finally:
+            self.scr.clear()
+            self.scr.refresh()
+
+    def run_term(self, cmd, wait=True, note=""):
+        with self.suspended():
+            print("\n\033[1m$ %s\033[0m%s\n" % (cmd if isinstance(cmd, str) else shlex.join(cmd),
+                                                 "   (%s)" % note if note else ""))
+            rc = self.host.interactive(cmd)
+            if wait:
+                print("\n%s" % ("done" if rc == 0 else "exit code %d" % rc))
+                pause()
+        self.refresh_soon()
+        return rc
+
+    def page(self, text, title="", end=False):
+        with self.suspended():
+            less = shutil.which("less")
+            if not less:
+                print(title + "\n" + text)
+                pause()
+                return
+            prompt = re.sub(r"([?:.%\\])", r"\\\1", (title + "  " if title else "") + "(q to return, / to search)")
+            env = dict(os.environ, LESS="-R", LESSSECURE="1")
+            p = subprocess.Popen([less, "-Ps" + prompt] + (["+G"] if end else []),
+                                 stdin=subprocess.PIPE, text=True, errors="replace", env=env)
+            try:
+                p.communicate(text)
+            except (BrokenPipeError, KeyboardInterrupt):
+                pass
+            while True:
+                try:
+                    p.wait()
+                    break
+                except KeyboardInterrupt:
+                    pass
+
+    # ---- curses primitives
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and 0 <= x < w:
+            try:
+                self.scr.addnstr(y, x, text, w - x, attr)
+            except curses.error:
+                pass
+
+    def box(self, y, x, h, w):
+        for i in range(h):
+            self.put(y + i, x, " " * w)
+        try:
+            self.scr.hline(y, x + 1, curses.ACS_HLINE, w - 2)
+            self.scr.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
+            self.scr.vline(y + 1, x, curses.ACS_VLINE, h - 2)
+            self.scr.vline(y + 1, x + w - 1, curses.ACS_VLINE, h - 2)
+            for yy, xx, ch in ((y, x, curses.ACS_ULCORNER), (y, x + w - 1, curses.ACS_URCORNER),
+                               (y + h - 1, x, curses.ACS_LLCORNER), (y + h - 1, x + w - 1, curses.ACS_LRCORNER)):
+                self.scr.addch(yy, xx, ch)
+        except curses.error:
+            pass
+
+    def read_key(self):
+        try:
+            return self.scr.get_wch()
+        except curses.error:
+            return None
+
+    def menu(self, title, items, note="", default=0):
+        """Popup menu of (key, label) items (None = separator). Returns the chosen key or None."""
+        choices = [i for i, it in enumerate(items) if it]
+        pos = min(default, len(choices) - 1)
+        while True:
+            self.draw_fn()
+            h, w = self.scr.getmaxyx()
+            note_lines = [ln for para in note.splitlines() for ln in wrap(para, min(70, w - 6))] if note else []
+            labels = ["" if it is None else " %s  %s " % (it[0], it[1]) for it in items]
+            bw = min(w, max([len(title) + 4] + [len(s) + 4 for s in labels + note_lines]))
+            bh = min(h, len(items) + len(note_lines) + (1 if note_lines else 0) + 4)
+            y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+            self.box(y0, x0, bh, bw)
+            self.put(y0, x0 + 2, " %s " % trunc(title, bw - 6), curses.A_BOLD)
+            y = y0 + 1
+            for ln in note_lines:
+                self.put(y, x0 + 2, ln, self.c_dim)
+                y += 1
+            if note_lines:
+                y += 1
+            for i, it in enumerate(items):
+                if y >= y0 + bh - 1:
+                    break
+                if it is None:
+                    try:
+                        self.scr.hline(y, x0 + 1, curses.ACS_HLINE, bw - 2)
+                    except curses.error:
+                        pass
+                else:
+                    attr = curses.A_REVERSE if i == choices[pos] else 0
+                    self.put(y, x0 + 2, labels[i].ljust(bw - 4), attr)
+                y += 1
+            self.put(y0 + bh - 1, x0 + 2, " Enter select · Esc cancel ", self.c_dim)
+            k = self.read_key()
+            if k is None or k == curses.KEY_RESIZE:
+                continue
+            if k in ("\x1b", "q") and not any(it and it[0] == "q" for it in items):
+                return None
+            if k == "\x1b":
+                return None
+            if k in (curses.KEY_UP, "k"):
+                pos = (pos - 1) % len(choices)
+            elif k in (curses.KEY_DOWN, "j"):
+                pos = (pos + 1) % len(choices)
+            elif k in ("\n", "\r", curses.KEY_ENTER):
+                return items[choices[pos]][0]
+            elif isinstance(k, str):
+                for it in items:
+                    if it and it[0] == k:
+                        return k
+
+    def confirm(self, question, note=""):
+        return self.menu(question, [("y", "Yes"), ("n", "No")], note=note, default=1) == "y"
+
+    def prompt(self, label, default=""):
+        """Single-line input on the bottom row. Returns None on Esc."""
+        buf = list(default)
+        curses.curs_set(1)
+        try:
+            while True:
+                self.draw_fn()
+                h, w = self.scr.getmaxyx()
+                text = label + " " + "".join(buf)
+                shown = text[-(w - 1):]
+                self.put(h - 1, 0, shown.ljust(w - 1), curses.A_BOLD)
+                self.scr.move(h - 1, min(len(shown), w - 1))
+                k = self.read_key()
+                if k is None or k == curses.KEY_RESIZE:
+                    continue
+                if k in ("\n", "\r", curses.KEY_ENTER):
+                    return "".join(buf).strip()
+                if k == "\x1b":
+                    return None
+                if k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    if buf:
+                        buf.pop()
+                elif k == "\x15":  # Ctrl-U
+                    buf = []
+                elif isinstance(k, str) and k.isprintable():
+                    buf.append(k)
+        finally:
+            curses.curs_set(0)
+
+    def pick(self, title, header, rows, hint):
+        """Full-screen list. Returns (key, index); key is "\\n" for Enter, None to go back."""
+        pos, top = 0, 0
+        prev = self.draw_fn
+
+        def draw():
+            nonlocal top
+            self.scr.erase()
+            h, w = self.scr.getmaxyx()
+            self.put(0, 0, (" %s  —  %s" % (title, self.host.label)).ljust(w), curses.A_REVERSE | curses.A_BOLD)
+            self.put(1, 0, " " + header, curses.A_BOLD)
+            lh = max(1, h - 3)
+            top = min(top, pos)
+            if pos >= top + lh:
+                top = pos - lh + 1
+            for i, row in enumerate(rows[top:top + lh]):
+                self.put(2 + i, 0, (" " + row).ljust(w), curses.A_REVERSE if top + i == pos else 0)
+            if not rows:
+                self.put(3, 2, "(nothing here)", self.c_dim)
+            self.footer(hint)
+
+        self.draw_fn = draw
+        try:
+            while True:
+                draw()
+                k = self.read_key()
+                if k is None or k == curses.KEY_RESIZE:
+                    continue
+                lh = max(1, self.scr.getmaxyx()[0] - 3)
+                if k in ("q", "\x1b", curses.KEY_LEFT):
+                    return None, None
+                if k in (curses.KEY_UP, "k"):
+                    pos = max(0, pos - 1)
+                elif k in (curses.KEY_DOWN, "j"):
+                    pos = min(len(rows) - 1, pos + 1)
+                elif k == curses.KEY_PPAGE:
+                    pos = max(0, pos - lh)
+                elif k == curses.KEY_NPAGE:
+                    pos = max(0, min(len(rows) - 1, pos + lh))
+                elif k in (curses.KEY_HOME, "g"):
+                    pos = 0
+                elif k in (curses.KEY_END, "G"):
+                    pos = max(0, len(rows) - 1)
+                elif k in ("\n", "\r", curses.KEY_ENTER):
+                    if rows:
+                        return "\n", pos
+                elif isinstance(k, str):
+                    return k, (pos if rows else None)
+        finally:
+            self.draw_fn = prev
+
+    def footer(self, hint):
+        h, w = self.scr.getmaxyx()
+        if self.msg and time.time() - self.msg_t < 8:
+            self.put(h - 1, 0, (" " + self.msg).ljust(w - 1), self.c_err if self.msg_err else self.c_ok)
+        else:
+            self.put(h - 1, 0, trunc(" " + hint, w - 1), self.c_dim)
+
+    # ---- main screen
+    def view(self):
+        f = self.filter.lower()
+        return [c for c in self.containers
+                if (self.show_all or c["state"] in ("running", "restarting", "paused"))
+                and (not f or f in ("%s %s %s" % (c["name"], c["image"], c["project"])).lower())]
+
+    def selected(self, view=None):
+        view = self.view() if view is None else view
+        if not view:
+            return None, 0
+        for i, c in enumerate(view):
+            if c["id"] == self.sel_id:
+                return c, i
+        self.sel_id = view[0]["id"]
+        return view[0], 0
+
+    def row_attr(self, c):
+        if c["id"] in self.busy:
+            return self.c_warn
+        s = c["state"]
+        if s == "running":
+            return {"unhealthy": self.c_err, "starting": self.c_warn}.get(c["health"], self.c_ok)
+        if s in ("restarting", "dead") or (s == "exited" and c["exit_code"] not in (0, 137, 143)):
+            return self.c_err
+        if s == "paused":
+            return self.c_warn
+        return self.c_dim
+
+    def draw_main(self):
+        s = self.scr
+        s.erase()
+        h, w = s.getmaxyx()
+        if h < 8 or w < 40:
+            self.put(0, 0, "Terminal too small")
+            return
+        view = self.view()
+        cur, idx = self.selected(view)
+        running = sum(c["state"] == "running" for c in self.containers)
+        title = " dockman  %s   %d/%d running" % (self.host.label, running, len(self.containers))
+        if not self.show_all:
+            title += "   [running only]"
+        if self.filter:
+            title += "   filter: " + self.filter
+        self.put(0, 0, title.ljust(w), curses.A_REVERSE | curses.A_BOLD)
+        clock = time.strftime(" %H:%M:%S ")
+        self.put(0, w - len(clock), clock, curses.A_REVERSE)
+
+        nw = min(max([len(c["name"]) for c in view] + [4]), 32)
+        pw = min(max([len(c["project"]) for c in view] + [7]), 18)
+        cols = [("NAME", nw), ("STATUS", 24), ("CPU", 7), ("MEM", 9), ("RESTART", 14),
+                ("PROJECT", pw), ("IMAGE", 32), ("PORTS", 0)]
+
+        def fmt(vals):
+            return " " + " ".join(trunc(v, cw).ljust(cw) if cw else v for v, (_, cw) in zip(vals, cols))
+
+        self.put(1, 0, fmt([n for n, _ in cols]), curses.A_BOLD | curses.A_UNDERLINE)
+        lh = h - 5
+        if idx < self.top:
+            self.top = idx
+        elif idx >= self.top + lh:
+            self.top = idx - lh + 1
+        self.top = max(0, min(self.top, max(0, len(view) - lh)))
+        for i, c in enumerate(view[self.top:self.top + lh]):
+            st = self.stats.get(c["id"], {}) if c["state"] == "running" else {}
+            line = fmt([c["name"], self.busy.get(c["id"], c["status"]), st.get("CPUPerc", ""),
+                        st.get("MemUsage", "").split(" / ")[0], c["restart"], c["project"], c["image"],
+                        ", ".join(c["ports"])])
+            attr = self.row_attr(c) | (curses.A_REVERSE if self.top + i == idx else 0)
+            self.put(2 + i, 0, line.ljust(w), attr)
+
+        if self.error:
+            self.put(3, 2, "Error: " + self.error, self.c_err)
+        elif not self.loaded:
+            self.put(3, 2, "Loading…", self.c_dim)
+        elif not view:
+            self.put(3, 2, "No containers%s.  Press a to add one." % (" match" if self.filter else ""), self.c_dim)
+
+        if cur:
+            d1 = " %s  %s  restarts: %s" % (cur["id"], cur["image"], cur["restart_count"])
+            if cur["ports"]:
+                d1 += "  ports: " + ", ".join(cur["ports"])
+            if cur["project"]:
+                d2 = " compose: %s/%s  %s" % (cur["project"], cur["service"], cur["wd"])
+            else:
+                st = self.stats.get(cur["id"], {})
+                d2 = " net I/O %s   block I/O %s   pids %s" % (st.get("NetIO", "-"), st.get("BlockIO", "-"),
+                                                             st.get("PIDs", "-")) if st else ""
+            self.put(h - 3, 0, d1, self.c_dim)
+            self.put(h - 2, 0, d2, self.c_dim)
+        self.footer(HINTS)
+
+    def run(self, stdscr):
+        self.scr = stdscr
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for n, col in ((1, curses.COLOR_GREEN), (2, curses.COLOR_YELLOW), (3, curses.COLOR_RED)):
+            curses.init_pair(n, col, -1)
+        self.c_ok, self.c_warn, self.c_err = (curses.color_pair(n) for n in (1, 2, 3))
+        self.c_dim = curses.A_DIM
+        stdscr.keypad(True)
+        stdscr.timeout(300)
+        for fn in (self.poll_containers, self.poll_stats):
+            threading.Thread(target=fn, daemon=True).start()
+        self.keymap = {k: (lbl, getattr(self, "a_" + fn), True) for k, lbl, fn in filter(None, CONTAINER_ACTIONS)}
+        self.keymap.update({k: (lbl, getattr(self, "g_" + fn), False) for k, lbl, fn in GLOBAL_ACTIONS})
+        try:
+            while True:
+                self.draw_main()
+                k = self.read_key()
+                if k is None or k == curses.KEY_RESIZE:
+                    continue
+                if self.on_key(k) is False:
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop_ev.set()
+
+    def on_key(self, k):
+        view = self.view()
+        cur, idx = self.selected(view)
+        lh = max(1, self.scr.getmaxyx()[0] - 5)
+        moves = {curses.KEY_UP: -1, "k": -1, curses.KEY_DOWN: 1, "j": 1,
+                 curses.KEY_PPAGE: -lh, curses.KEY_NPAGE: lh, curses.KEY_HOME: -10 ** 6, "g": -10 ** 6,
+                 curses.KEY_END: 10 ** 6, "G": 10 ** 6}
+        if k in moves:
+            if view:
+                self.sel_id = view[max(0, min(len(view) - 1, idx + moves[k]))]["id"]
+            return True
+        if k in ("\n", "\r", curses.KEY_ENTER):
+            if not cur:
+                return True
+            items = [None if a is None else a[:2] for a in CONTAINER_ACTIONS]
+            k = self.menu("%s  (%s)" % (cur["name"], cur["state"]), items)
+            if k is None:
+                return True
+        if k not in self.keymap:
+            return True
+        _, fn, needs = self.keymap[k]
+        if needs:
+            if not cur:
+                self.flash("No container selected", err=True)
+                return True
+            return fn(cur)
+        return fn()
+
+    # ------------------------------------------------------- container actions
+    def a_start(self, c):
+        if c["state"] == "paused":
+            self.bg(c, "unpause", ["docker", "unpause", c["name"]])
+        elif c["state"] == "running":
+            self.flash("%s is already running" % c["name"])
+        else:
+            self.bg(c, "start", ["docker", "start", c["name"]])
+
+    def a_stop(self, c):
+        if c["state"] not in ("running", "restarting", "paused"):
+            return self.flash("%s is not running" % c["name"])
+        note = {
+            "always": "Restart policy is 'always': Docker leaves it stopped now, but starts it again "
+                      "when the Docker daemon or server restarts. Use X to stop it for good.",
+            "unless-stopped": "Restart policy is 'unless-stopped': it stays stopped, even across reboots, "
+                              "until you start it.",
+        }.get(c["restart"], "")
+        if self.confirm("Stop %s?" % c["name"], note):
+            self.bg(c, "stop", ["docker", "stop", c["name"]])
+
+    def a_stop_hard(self, c):
+        note = "Sets the restart policy to 'no' and stops it, so nothing brings it back automatically."
+        if c["project"]:
+            note += "\nNote: compose re-applies its own policy on the next 'up' of project %s." % c["project"]
+        if not self.confirm("Disable auto-restart and stop %s?" % c["name"], note):
+            return
+        script = "docker update --restart=no %s >/dev/null" % q(c["name"])
+        if c["state"] in ("running", "restarting", "paused"):
+            script += " && docker stop %s" % q(c["name"])
+        self.bg(c, "stop (no restart)", script)
+
+    def a_restart(self, c):
+        if self.confirm("Restart %s?" % c["name"]):
+            self.bg(c, "restart", ["docker", "restart", c["name"]])
+
+    def a_pause(self, c):
+        if c["state"] == "paused":
+            self.bg(c, "unpause", ["docker", "unpause", c["name"]])
+        elif c["state"] == "running":
+            self.bg(c, "pause", ["docker", "pause", c["name"]])
+        else:
+            self.flash("%s is not running" % c["name"], err=True)
+
+    def a_kill(self, c):
+        if c["state"] not in ("running", "restarting", "paused"):
+            return self.flash("%s is not running" % c["name"])
+        if self.confirm("Kill %s (SIGKILL, no clean shutdown)?" % c["name"]):
+            self.bg(c, "kill", ["docker", "kill", c["name"]])
+
+    def a_remove(self, c):
+        note = ""
+        if c["state"] in ("running", "restarting", "paused"):
+            note = "It is running and will be force-stopped first. "
+        if c["project"]:
+            note += "It belongs to compose project '%s' and will be re-created on the next 'up'." % c["project"]
+        k = self.menu("Remove %s?" % c["name"], [("r", "Remove container"),
+                                                 ("v", "Remove container and its anonymous volumes"),
+                                                 ("n", "Cancel")], note=note, default=2)
+        if k in ("r", "v") and self.confirm("Really remove %s?" % c["name"]):
+            self.bg(c, "remove", ["docker", "rm", "-f"] + (["-v"] if k == "v" else []) + [c["name"]])
+
+    def a_logs(self, c, args=("--tail", "5000"), grep=None):
+        out = self.capture(shlex.join(["docker", "logs", "-t"] + list(args) + [c["name"]]) + " 2>&1", timeout=120)
+        if out is None:
+            return
+        if grep:
+            try:
+                rx = re.compile(grep, re.I)
+            except re.error:
+                rx = re.compile(re.escape(grep), re.I)
+            out = "\n".join(ln for ln in out.splitlines() if rx.search(ln))
+        self.page(out or "(no log output)", "logs %s" % c["name"], end=True)
+
+    def a_logs_opts(self, c):
+        since = self.prompt("Since (e.g. 30m, 6h, 2026-10-24T09:00; blank = beginning):")
+        if since is None:
+            return
+        tail = self.prompt("Last N lines only (blank = all):")
+        if tail is None:
+            return
+        grep = self.prompt("Only lines matching (text or regex, blank = all):")
+        if grep is None:
+            return
+        args = (["--since", since] if since else []) + (["--tail", tail] if tail else [])
+        self.a_logs(c, args, grep)
+
+    def a_follow(self, c):
+        self.run_term(["docker", "logs", "-f", "-t", "--tail", "200", c["name"]], wait=False,
+                      note="Ctrl-C to return")
+
+    def a_shell(self, c):
+        if c["state"] != "running":
+            return self.flash("%s is not running" % c["name"], err=True)
+        with self.suspended():
+            print("\n\033[1mShell in %s\033[0m (exit or Ctrl-D to return)\n" % c["name"])
+            rc = self.host.interactive(["docker", "exec", "-it", c["name"], "sh", "-c", SHELL_PICKER])
+            if rc in (125, 126, 127):
+                print("\nCould not start a shell (the image may not contain one).")
+                pause()
+
+    def a_exec_cmd(self, c):
+        if c["state"] != "running":
+            return self.flash("%s is not running" % c["name"], err=True)
+        cmd = self.prompt("Command to run in %s:" % c["name"])
+        if cmd:
+            self.run_term(["docker", "exec", "-it", c["name"], "sh", "-c", cmd])
+
+    def a_info(self, c):
+        d = c["raw"]
+        st, cfg, hc = d.get("State") or {}, d.get("Config") or {}, d.get("HostConfig") or {}
+        L = ["Name:        %s" % c["name"],
+             "ID:          %s" % d.get("Id", ""),
+             "Image:       %s  (%s)" % (c["image"], c["image_id"][:19]),
+             "Created:     %s" % d.get("Created", "")[:19].replace("T", " "),
+             "State:       %s   %s" % (c["state"], c["status"]),
+             "Started:     %s" % st.get("StartedAt", "")[:19].replace("T", " "),
+             "Finished:    %s" % (st.get("FinishedAt", "")[:19].replace("T", " ") if c["state"] != "running" else "-"),
+             "Exit code:   %s%s" % (st.get("ExitCode"), "  (OOM killed)" if st.get("OOMKilled") else ""),
+             "Restart:     policy=%s   restart count=%s" % (c["restart"], c["restart_count"])]
+        if st.get("Error"):
+            L.append("Error:       %s" % st["Error"])
+        if c["project"]:
+            L += ["Compose:     project=%s service=%s" % (c["project"], c["service"]),
+                  "             dir=%s" % c["wd"], "             files=%s" % ", ".join(c["files"])]
+        L += ["Entrypoint:  %s" % shlex.join(cfg.get("Entrypoint") or []),
+              "Command:     %s" % shlex.join(cfg.get("Cmd") or []),
+              "Working dir: %s" % (cfg.get("WorkingDir") or "/"),
+              "User:        %s" % (cfg.get("User") or "(image default)"),
+              "", "Ports:"]
+        L += ["  " + p for p in c["ports"]] or ["  (none published)"]
+        L += ["", "Mounts:"]
+        L += ["  %-6s %s -> %s%s" % (m.get("Type"), m.get("Name") or m.get("Source"), m.get("Destination"),
+                                     "" if m.get("RW", True) else " (ro)") for m in d.get("Mounts") or []] or ["  (none)"]
+        L += ["", "Networks:"]
+        for n, v in ((d.get("NetworkSettings") or {}).get("Networks") or {}).items():
+            L.append("  %-20s ip=%s  gateway=%s" % (n, v.get("IPAddress") or "-", v.get("Gateway") or "-"))
+        lim = []
+        if hc.get("Memory"):
+            lim.append("memory=%dMiB" % (hc["Memory"] // 1048576))
+        if hc.get("NanoCpus"):
+            lim.append("cpus=%g" % (hc["NanoCpus"] / 1e9))
+        L += ["", "Limits:      %s" % (" ".join(lim) or "none")]
+        L += ["", "Environment:"] + ["  " + e for e in cfg.get("Env") or []]
+        labels = {k: v for k, v in (cfg.get("Labels") or {}).items() if not k.startswith("com.docker.compose.")}
+        if labels:
+            L += ["", "Labels:"] + ["  %s=%s" % kv for kv in sorted(labels.items())]
+        hl = (st.get("Health") or {}).get("Log") or []
+        if hl:
+            L += ["", "Health checks (latest last):"]
+            for e in hl[-5:]:
+                L.append("  %s exit=%s  %s" % (e.get("Start", "")[:19].replace("T", " "), e.get("ExitCode"),
+                                               (e.get("Output") or "").strip().replace("\n", " ")[:200]))
+        self.page("\n".join(L) + "\n", "info %s" % c["name"])
+
+    def a_inspect(self, c):
+        self.page(json.dumps(c["raw"], indent=2), "inspect %s" % c["name"])
+
+    def a_top(self, c):
+        if c["state"] != "running":
+            return self.flash("%s is not running" % c["name"], err=True)
+        out = self.capture(["docker", "top", c["name"]])
+        if out is not None:
+            self.page(out, "processes in %s" % c["name"])
+
+    def a_live_stats(self, c):
+        self.run_term(["docker", "stats", c["name"]], wait=False, note="Ctrl-C to return")
+
+    def a_policy(self, c):
+        k = self.menu("Restart policy for %s (now: %s)" % (c["name"], c["restart"]),
+                      [("u", "unless-stopped  (restart unless you stopped it)"),
+                       ("a", "always          (restart, even after a manual stop + reboot)"),
+                       ("f", "on-failure      (restart only on non-zero exit)"),
+                       ("n", "no              (never restart automatically)")],
+                      note="Compose re-applies its own value on the next 'up'." if c["project"] else "")
+        if not k:
+            return
+        pol = {"u": "unless-stopped", "a": "always", "f": "on-failure", "n": "no"}[k]
+        if k == "f":
+            n = self.prompt("Max retries (blank = unlimited):")
+            if n is None:
+                return
+            if n.isdigit():
+                pol += ":" + n
+        self.bg(c, "set restart=%s" % pol, ["docker", "update", "--restart", pol, c["name"]])
+
+    def a_rename(self, c):
+        new = self.prompt("New name for %s:" % c["name"], c["name"])
+        if new and new != c["name"]:
+            self.bg(c, "rename", ["docker", "rename", c["name"], new])
+
+    def container_spec(self, c):
+        rc, out, _ = self.host.run(["docker", "image", "inspect", "--format", "{{json .Config}}", c["image_id"]])
+        try:
+            img_cfg = json.loads(out) if rc == 0 else {}
+        except ValueError:
+            img_cfg = {}
+        return spec_from_inspect(c["raw"], img_cfg or {})
+
+    def a_export(self, c):
+        sp = self.container_spec(c)
+        text = ("# Best-effort reconstruction of %s. Covers name, image, restart policy, ports,\n"
+                "# volumes/binds, environment (minus image defaults), network, devices,\n"
+                "# capabilities and command. Check it before relying on it.\n\n"
+                "# --- docker run ---\n%s\n\n# --- compose.yaml ---\n%s") % (c["name"], spec_run_text(sp), spec_compose(sp))
+        self.page(text, "export %s" % c["name"])
+
+    def a_update(self, c):
+        if not c["project"]:
+            return self.flash("Only compose containers can be recreated safely; use E to export it to compose.",
+                              err=True)
+        p = self.project_from(c)
+        if self.confirm("Pull the latest image for %s/%s and recreate it?" % (c["project"], c["service"])):
+            svc = [c["service"]] if c["service"] else []
+            self.run_term(shlex.join(self.compose_cmd(p, "pull", *svc)) + " && " +
+                          shlex.join(self.compose_cmd(p, "up", "-d", *svc)))
+
+    def a_compose_sel(self, c):
+        if not c["project"]:
+            return self.flash("%s is not part of a compose project" % c["name"], err=True)
+        self.compose_menu(self.project_from(c))
+
+    # ---------------------------------------------------------------- compose
+    def project_from(self, c):
+        return {"name": c["project"], "wd": c["wd"], "files": c["files"]}
+
+    def compose_cmd(self, p, *args):
+        cmd = list(self.compose) + ["-p", p["name"]]
+        if p.get("wd"):
+            cmd += ["--project-directory", p["wd"]]
+        for f in p.get("files") or []:
+            cmd += ["-f", f]
+        return cmd + list(args)
+
+    def list_projects(self):
+        projects = {}
+        rc, out, _ = self.host.run(list(self.compose) + ["ls", "-a", "--format", "json"])
+        try:
+            for r in json.loads(out) if rc == 0 and out.strip() else []:
+                files = [f for f in (r.get("ConfigFiles") or "").split(",") if f]
+                projects[r["Name"]] = {"name": r["Name"], "status": r.get("Status", ""), "files": files,
+                                       "wd": os.path.dirname(files[0]) if files else ""}
+        except (ValueError, KeyError, TypeError):
+            pass
+        for c in self.containers:  # also covers docker-compose v1, which has no `ls`
+            if c["project"]:
+                p = projects.setdefault(c["project"], {"name": c["project"], "status": "", "files": c["files"],
+                                                       "wd": c["wd"]})
+                p["wd"] = c["wd"] or p["wd"]
+        for p in projects.values():
+            if not p["status"]:
+                cs = [c for c in self.containers if c["project"] == p["name"]]
+                p["status"] = "running(%d) / total(%d)" % (sum(c["state"] == "running" for c in cs), len(cs))
+        return sorted(projects.values(), key=lambda p: p["name"])
+
+    def g_projects(self):
+        while True:
+            projects = self.list_projects()
+            rows = ["%-28s %-26s %s" % (trunc(p["name"], 28), trunc(p["status"], 26), ", ".join(p["files"]))
+                    for p in projects]
+            k, i = self.pick("Compose projects", "%-28s %-26s %s" % ("NAME", "STATUS", "COMPOSE FILES"), rows,
+                             "Enter actions  a new project  o start existing compose file  q back")
+            if k is None:
+                return
+            if k == "a":
+                self.compose_new()
+            elif k == "o":
+                self.compose_existing()
+            elif k == "\n" and i is not None:
+                self.compose_menu(projects[i])
+
+    def compose_menu(self, p):
+        p = dict(p)
+        if p.get("files"):
+            rc, _, _ = self.host.run(" && ".join("test -f %s" % q(f) for f in p["files"]))
+            if rc != 0:
+                self.flash("Compose file(s) for %s no longer exist; only stop/start/down will work." % p["name"],
+                           err=True)
+                p["files"], p["wd"] = [], ""
+        items = [("u", "Up (create/apply changes, detached)"),
+                 ("U", "Pull newer images and up (update)"),
+                 ("s", "Start"), ("x", "Stop"), ("r", "Restart"),
+                 ("d", "Down (remove containers & networks)"),
+                 ("D", "Down and delete its volumes"),
+                 None,
+                 ("l", "Follow logs"), ("p", "Status (ps)"),
+                 ("c", "Show resolved config"),
+                 ("e", "Edit compose file"),
+                 ("b", "Back")]
+        while True:
+            k = self.menu("Compose: %s" % p["name"], items, note=p.get("wd") or "")
+            if k in (None, "b"):
+                return
+            if k == "u":
+                self.run_term(self.compose_cmd(p, "up", "-d", "--remove-orphans"))
+            elif k == "U":
+                self.run_term(shlex.join(self.compose_cmd(p, "pull")) + " && " +
+                              shlex.join(self.compose_cmd(p, "up", "-d", "--remove-orphans")))
+            elif k in ("s", "x", "r"):
+                self.run_term(self.compose_cmd(p, {"s": "start", "x": "stop", "r": "restart"}[k]))
+            elif k == "d" and self.confirm("Bring %s down (containers removed, volumes kept)?" % p["name"]):
+                self.run_term(self.compose_cmd(p, "down"))
+            elif k == "D" and self.confirm("Bring %s down AND DELETE its volumes (data loss)?" % p["name"]):
+                self.run_term(self.compose_cmd(p, "down", "-v"))
+            elif k == "l":
+                self.run_term(self.compose_cmd(p, "logs", "-f", "-t", "--tail", "100"), wait=False,
+                              note="Ctrl-C to return")
+            elif k == "p":
+                out = self.capture(self.compose_cmd(p, "ps", "-a"))
+                if out is not None:
+                    self.page(out, "compose ps %s" % p["name"])
+            elif k == "c":
+                out = self.capture(self.compose_cmd(p, "config"))
+                if out is not None:
+                    self.page(out, "compose config %s" % p["name"])
+            elif k == "e":
+                self.compose_edit(p)
+
+    def compose_edit(self, p):
+        files = p.get("files") or []
+        if not files:
+            return self.flash("No compose file known for %s" % p["name"], err=True)
+        path = files[0]
+        if len(files) > 1:
+            k = self.menu("Which file?", [(str(i + 1), f) for i, f in enumerate(files[:9])])
+            if not k:
+                return
+            path = files[int(k) - 1]
+        rc, text, err = self.host.run(["cat", "--", path])
+        if rc != 0:
+            return self.flash("Cannot read %s: %s" % (path, err.strip()), err=True)
+        with self.suspended():
+            try:
+                new = edit_text(text)
+                if new is None:
+                    print("No editor found: set $EDITOR (or install nano/vim).")
+                    return pause()
+                if new == text:
+                    print("No changes.")
+                    return
+                self.host.run(["cp", "-p", "--", path, path + ".bak"])
+                while True:
+                    rc, out, err = self.host.write_file(path, new)
+                    if rc != 0:
+                        print("Write failed: " + err)
+                        return pause()
+                    rc, out, err = self.host.run(self.compose_cmd(p, "config", "-q"))
+                    if rc == 0:
+                        print("Saved %s (previous version kept as %s.bak)." % (path, os.path.basename(path)))
+                        break
+                    print("\n\033[31mThe compose file does not validate:\033[0m\n" + (err or out))
+                    choice = ask("[e]dit again, [r]estore previous version, [k]eep anyway", "e").lower()
+                    if choice.startswith("r"):
+                        self.host.run(["cp", "-p", "--", path + ".bak", path])
+                        print("Restored.")
+                        return pause()
+                    if choice.startswith("k"):
+                        return pause()
+                    new = edit_text(new)
+                if ask_yn("Apply the changes now (docker compose up -d)?"):
+                    self.host.interactive(self.compose_cmd(p, "up", "-d", "--remove-orphans"))
+                    pause()
+            except Cancel:
+                print("Cancelled.")
+        self.refresh_soon()
+
+    def compose_new(self, yaml_text=None, name=""):
+        with self.suspended():
+            try:
+                self._compose_new(yaml_text, name)
+            except Cancel:
+                print("Cancelled.")
+                pause()
+        self.refresh_soon()
+
+    def _compose_new(self, yaml_text, name):
+        print("\n\033[1mNew compose project on %s\033[0m  (Ctrl-C cancels)\n" % self.host.label)
+        name = slug(ask("Project name", slug(name) if name else "", required=True))
+        root = os.environ.get("DOCKMAN_COMPOSE_ROOT") or self.home() + "/docker"
+        d = self.expand(ask("Directory on the server", "%s/%s" % (root.rstrip("/"), name))).rstrip("/")
+        rc, existing, _ = self.host.run("cd %s 2>/dev/null && ls %s 2>/dev/null" % (q(d), " ".join(COMPOSE_NAMES)))
+        if existing.strip():
+            print("%s already contains: %s" % (d, existing.split()))
+            if not ask_yn("Overwrite %s/compose.yaml?" % d, False):
+                raise Cancel()
+        path = d + "/compose.yaml"
+        p = {"name": name, "wd": d, "files": [path]}
+
+        if yaml_text is None:
+            how = ask("Write it in your [e]ditor from a template, or [p]aste it", "e").lower()
+            if how.startswith("p"):
+                yaml_text = read_pasted("Paste the compose YAML:")
+            else:
+                yaml_text = edit_text(COMPOSE_TEMPLATE.format(name=name))
+                if yaml_text is None:
+                    yaml_text = read_pasted("No editor found ($EDITOR). Paste the compose YAML instead:")
+        else:
+            print("\n" + yaml_text)
+            if ask_yn("Review/edit it in your editor first?", False):
+                yaml_text = edit_text(yaml_text) or yaml_text
+
+        while True:
+            rc, _, err = self.host.write_file(path, yaml_text)
+            if rc != 0:
+                print("Could not write %s: %s" % (path, err))
+                return pause()
+            rc, out, err = self.host.run(self.compose_cmd(p, "config", "-q"))
+            if rc == 0:
+                print("Wrote %s" % path)
+                break
+            print("\n\033[31mThe compose file does not validate:\033[0m\n" + (err or out))
+            if not ask("[e]dit again or [k]eep it as is (it won't be started)", "e").lower().startswith("e"):
+                return pause()
+            yaml_text = edit_text(yaml_text) or read_pasted("Paste the corrected YAML:")
+
+        if ask_yn("Start it now (docker compose up -d)?"):
+            self.host.interactive(self.compose_cmd(p, "up", "-d"))
+        pause()
+
+    def compose_existing(self):
+        with self.suspended():
+            try:
+                print("\n\033[1mStart an existing compose file on %s\033[0m  (Ctrl-C cancels)\n" % self.host.label)
+                path = self.expand(ask("Path on the server to a compose file or its directory", required=True))
+                rc, out, _ = self.host.run('if [ -d %s ]; then echo dir; elif [ -f %s ]; then echo file; fi'
+                                           % (q(path), q(path)))
+                kind = out.strip()
+                if not kind:
+                    print("Not found: " + path)
+                    return pause()
+                d, f = (path, None) if kind == "dir" else (os.path.dirname(path) or ".", os.path.basename(path))
+                name = ask("Project name (blank = directory name)")
+                cmd = list(self.compose) + (["-p", slug(name)] if name else []) + (["-f", f] if f else []) + ["up", "-d"]
+                script = "cd %s && %s" % (q(d), shlex.join(cmd))
+                print("\n$ " + script + "\n")
+                self.host.interactive(script)
+                pause()
+            except Cancel:
+                print("Cancelled.")
+        self.refresh_soon()
+
+    # ------------------------------------------------------------ adding things
+    def g_add(self):
+        k = self.menu("Add", [("r", "New container: guided 'docker run'"),
+                              ("p", "New container: paste a 'docker run' command"),
+                              ("c", "New compose project (write a compose.yaml)"),
+                              ("o", "Start an existing compose file / directory")])
+        if k == "r":
+            self.run_wizard()
+        elif k == "p":
+            self.run_pasted()
+        elif k == "c":
+            self.compose_new()
+        elif k == "o":
+            self.compose_existing()
+
+    def run_wizard(self, sp=None):
+        to_compose = None
+        with self.suspended():
+            try:
+                to_compose = self._run_wizard(sp or {})
+            except Cancel:
+                print("Cancelled.")
+                pause()
+        if to_compose:
+            self.compose_new(spec_compose(to_compose), to_compose.get("name") or "")
+        self.refresh_soon()
+
+    def _run_wizard(self, sp):
+        while True:
+            print("\n\033[1mNew container on %s\033[0m  (Ctrl-C cancels; Enter keeps the [default])\n"
+                  % self.host.label)
+            sp["image"] = ask("Image (e.g. nginx:alpine, ghcr.io/org/app:1.2)", sp.get("image", ""), required=True)
+            sp["name"] = ask("Container name", sp.get("name") or slug(sp["image"].split("/")[-1].split(":")[0]))
+            sp["ports"] = ask("Publish ports host:container, space separated (e.g. 8080:80 127.0.0.1:5432:5432)",
+                              " ".join(sp.get("ports", []))).replace(",", " ").split()
+            sp["volumes"] = ask_list("Volumes / bind mounts  (named_volume:/path, /host/path:/path[:ro])",
+                                     sp.get("volumes", []))
+            sp["env"] = ask_list("Environment variables  (KEY=value)", sp.get("env", []))
+            pol = {"u": "unless-stopped", "a": "always", "o": "on-failure", "n": "no"}
+            cur = next((k for k, v in pol.items() if v == sp.get("restart")), "u")
+            sp["restart"] = pol.get(ask("Restart policy: [u]nless-stopped, [a]lways, [o]n-failure, [n]o",
+                                        cur).lower()[:1], "unless-stopped")
+            sp["network"] = ask("Network (blank = default bridge, 'host', or an existing network name)",
+                                sp.get("network", ""))
+            sp["extra"] = shlex.split(ask("Extra docker run options (e.g. --memory 512m --user 1000:1000)",
+                                          shlex.join(sp.get("extra", []))))
+            sp["command"] = shlex.split(ask("Command (blank = image default)", shlex.join(sp.get("command", []))))
+
+            print("\n\033[1mCommand:\033[0m\n" + spec_run_text(sp) + "\n")
+            choice = ask("[r]un it, [e]dit answers, save as [c]ompose project instead, [q]uit", "r").lower()[:1]
+            if choice == "e":
+                continue
+            if choice == "c":
+                return sp
+            if choice != "r":
+                raise Cancel()
+            rc = self.host.interactive(spec_run_argv(sp))
+            if rc == 0:
+                print("\nContainer %s started." % (sp["name"] or ""))
+                pause()
+                return None
+            if not ask_yn("\ndocker run failed (exit %d). Edit and try again?" % rc):
+                return None
+
+    def run_pasted(self):
+        with self.suspended():
+            try:
+                print("\n\033[1mPaste a docker run command\033[0m (lines ending in \\ continue; Ctrl-C cancels)\n")
+                parts = []
+                while True:
+                    line = ask(">" if not parts else " ").rstrip()
+                    if line.endswith("\\"):
+                        parts.append(line[:-1])
+                        continue
+                    parts.append(line)
+                    break
+                script = " ".join(parts).strip()
+                try:
+                    toks = shlex.split(script)
+                except ValueError as e:
+                    print("Could not parse: %s" % e)
+                    return pause()
+                rest = toks[1:] if toks[:1] == ["sudo"] else toks
+                if rest[:2] == ["docker", "run"]:
+                    opts = rest[2:]
+                elif rest[:3] == ["docker", "container", "run"]:
+                    opts = rest[3:]
+                else:
+                    print("That does not start with 'docker run'.")
+                    return pause()
+                detached = any(re.fullmatch(r"-[a-zA-Z]*d[a-zA-Z]*", t) or t in ("--detach", "--detach=true")
+                               for t in opts)
+                interactive = any(re.fullmatch(r"-[a-zA-Z]*[it][a-zA-Z]*", t) for t in opts)
+                if not detached and not interactive and ask_yn("Add -d so it runs in the background?"):
+                    script = re.sub(r"^(\s*(?:sudo\s+)?docker\s+(?:container\s+)?run)\b", r"\1 -d", script, count=1)
+                print("\n$ " + script + "\n")
+                if ask_yn("Run it?"):
+                    rc = self.host.interactive(script)
+                    print("\n%s" % ("started" if rc == 0 else "exit code %d" % rc))
+                    pause()
+            except Cancel:
+                print("Cancelled.")
+        self.refresh_soon()
+
+    # -------------------------------------------------------- images & friends
+    def g_manage(self):
+        while True:
+            k = self.menu("Manage %s" % self.host.label,
+                          [("i", "Images"), ("v", "Volumes"), ("n", "Networks"), None,
+                           ("e", "Recent events (last hour)"), ("D", "Disk usage"),
+                           ("x", "Prune unused things…"), ("I", "Docker / server info")])
+            if k is None:
+                return
+            if k == "i":
+                self.images_screen()
+            elif k == "v":
+                self.volumes_screen()
+            elif k == "n":
+                self.networks_screen()
+            elif k == "e":
+                out = self.capture('docker events --since 1h --until "$(date +%s)"', timeout=60)
+                if out is not None:
+                    self.page(out or "(no events in the last hour)", "events", end=True)
+            elif k == "D":
+                self.g_disk()
+            elif k == "x":
+                self.prune_menu()
+            elif k == "I":
+                out = self.capture(["docker", "info"])
+                if out is not None:
+                    self.page(out, "docker info")
+
+    def image_dates(self, ids):
+        """{full image id: (built, pulled)}; pulled is None when Docker has no record of it."""
+        ids = sorted(set(ids))
+        rc, out, _ = self.host.run(["docker", "image", "inspect"] + ids) if ids else (1, "", "")
+        dates = {}
+        for im in json.loads(out or "[]") if rc == 0 else []:
+            dates[im["Id"]] = (parse_ts(im.get("Created", "")),
+                               parse_ts((im.get("Metadata") or {}).get("LastTagTime", "")))
+        return dates
+
+    def images_screen(self):
+        while True:
+            out = self.capture(["docker", "image", "ls", "--no-trunc", "--format", "{{json .}}"])
+            if out is None:
+                return
+            imgs = json_lines(out)
+            dates = self.image_dates(im["ID"] for im in imgs)
+            used = {c["image_id"][7:19] for c in self.containers}
+            for im in imgs:
+                im["ref"] = im["ID"] if im.get("Repository") == "<none>" else "%s:%s" % (im["Repository"], im["Tag"])
+            fmt = "%-50s %-12s %9s  %-8s %-8s %s"
+            rows = [fmt % (trunc(im["ref"], 50), im["ID"][7:19], im.get("Size", ""),
+                           *(ago(d) if d else "-" for d in dates.get(im["ID"], (None, None))),
+                           "in use" if im["ID"][7:19] in used else "")
+                    for im in imgs]
+            k, i = self.pick("Images", fmt % ("IMAGE", "ID", "SIZE", "BUILT", "PULLED", ""),
+                             rows, "Enter actions  r run  u pull/update  d remove  i inspect  h history  "
+                                   "P pull new  q back")
+            if k is None:
+                return
+            if k == "P":
+                ref = self.prompt("Image to pull:")
+                if ref:
+                    self.run_term(["docker", "pull", ref])
+                continue
+            if i is None:
+                continue
+            im = imgs[i]
+            if k == "\n":
+                k = self.menu(im["ref"], [("r", "Run a new container from it"), ("u", "Pull / update this tag"),
+                                          ("d", "Remove"), ("i", "Inspect"), ("h", "Layer history")])
+            if k == "r":
+                self.run_wizard({"image": im["ref"]})
+            elif k == "u":
+                if im.get("Repository") == "<none>":
+                    self.flash("Untagged image; nothing to pull", err=True)
+                else:
+                    self.run_term(["docker", "pull", im["ref"]])
+            elif k == "d" and self.confirm("Remove image %s?" % im["ref"]):
+                self.run_term(["docker", "image", "rm", im["ref"]])
+            elif k in ("i", "h"):
+                cmd = ["docker", "image", "inspect", im["ID"]] if k == "i" else \
+                      ["docker", "image", "history", "--no-trunc", im["ID"]]
+                out = self.capture(cmd)
+                if out is not None:
+                    self.page(out, im["ref"])
+
+    def volumes_screen(self):
+        while True:
+            out = self.capture(["docker", "volume", "ls", "--format", "{{json .}}"])
+            if out is None:
+                return
+            vols = json_lines(out)
+            users = {}
+            for c in self.containers:
+                for m in c["raw"].get("Mounts") or []:
+                    if m.get("Type") == "volume":
+                        users.setdefault(m.get("Name"), []).append(c["name"])
+            rows = ["%-50s %-8s %s" % (trunc(v["Name"], 50), v.get("Driver", ""), ", ".join(users.get(v["Name"], [])))
+                    for v in vols]
+            k, i = self.pick("Volumes", "%-50s %-8s %s" % ("NAME", "DRIVER", "USED BY"), rows,
+                             "Enter/i inspect  d remove  c create  q back")
+            if k is None:
+                return
+            if k == "c":
+                name = self.prompt("New volume name:")
+                if name:
+                    self.capture(["docker", "volume", "create", name])
+            elif i is None:
+                continue
+            elif k in ("\n", "i"):
+                out = self.capture(["docker", "volume", "inspect", vols[i]["Name"]])
+                if out is not None:
+                    self.page(out, vols[i]["Name"])
+            elif k == "d":
+                v = vols[i]["Name"]
+                note = "Used by: %s" % ", ".join(users[v]) if v in users else ""
+                if self.confirm("Delete volume %s and all its data?" % v, note):
+                    if self.capture(["docker", "volume", "rm", v]) is not None:
+                        self.flash("Removed volume " + v)
+
+    def networks_screen(self):
+        while True:
+            out = self.capture(["docker", "network", "ls", "--format", "{{json .}}"])
+            if out is None:
+                return
+            nets = json_lines(out)
+            users = {}
+            for c in self.containers:
+                for n in ((c["raw"].get("NetworkSettings") or {}).get("Networks") or {}):
+                    users.setdefault(n, []).append(c["name"])
+            rows = ["%-32s %-10s %-7s %s" % (trunc(n["Name"], 32), n.get("Driver", ""), n.get("Scope", ""),
+                                             ", ".join(users.get(n["Name"], []))) for n in nets]
+            k, i = self.pick("Networks", "%-32s %-10s %-7s %s" % ("NAME", "DRIVER", "SCOPE", "CONTAINERS"), rows,
+                             "Enter/i inspect  d remove  c create  q back")
+            if k is None:
+                return
+            if k == "c":
+                name = self.prompt("New network name (bridge driver):")
+                if name:
+                    self.capture(["docker", "network", "create", name])
+            elif i is None:
+                continue
+            elif k in ("\n", "i"):
+                out = self.capture(["docker", "network", "inspect", nets[i]["Name"]])
+                if out is not None:
+                    self.page(out, nets[i]["Name"])
+            elif k == "d":
+                n = nets[i]["Name"]
+                if n in ("bridge", "host", "none"):
+                    self.flash("Built-in network %s cannot be removed" % n, err=True)
+                elif self.confirm("Remove network %s?" % n):
+                    if self.capture(["docker", "network", "rm", n]) is not None:
+                        self.flash("Removed network " + n)
+
+    def disk_summary(self):
+        out = self.capture(["docker", "system", "df", "--format", "{{json .}}"], timeout=120)
+        if out is None:
+            return None
+        L = ["%-14s %7s %7s %10s  %s" % ("TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE")]
+        for r in json_lines(out):
+            L.append("%-14s %7s %7s %10s  %s" % (r.get("Type", ""), r.get("TotalCount", ""), r.get("Active", ""),
+                                                   r.get("Size", ""), r.get("Reclaimable", "")))
+        rc, fs, _ = self.host.run('df -h "$(docker info --format "{{.DockerRootDir}}")" | tail -n 1')
+        if rc == 0 and fs.strip():
+            p = fs.split()
+            if len(p) >= 6:
+                L += ["", "Filesystem %s: %s used of %s (%s), %s free" % (p[5], p[2], p[1], p[4], p[3])]
+        return "\n".join(L)
+
+    def disk_images_table(self):
+        """The Images part of `docker system df -v`, with both build and pull dates."""
+        rc, out, _ = self.host.run(["docker", "system", "df", "-v", "--format", "json"], timeout=120)
+        try:
+            imgs = json.loads(out)["Images"] or [] if rc == 0 else None
+        except (ValueError, KeyError, TypeError):
+            imgs = None
+        if imgs is None:
+            return ""
+        dates = self.image_dates(im["ID"] for im in imgs)
+        fmt = "%-40s %-12s %-9s %-9s %-9s %-11s %s"
+        L = ["Images space usage:", "", fmt % ("IMAGE", "ID", "BUILT", "PULLED", "SIZE", "UNIQUE SIZE", "CONTAINERS")]
+        for im in imgs:
+            ref = im["ID"][7:19] if im.get("Repository") == "<none>" else "%s:%s" % (im["Repository"], im["Tag"])
+            built, pulled = dates.get(im["ID"], (None, None))
+            L.append(fmt % (trunc(ref, 40), im["ID"][7:19], ago(built) if built else "-",
+                            ago(pulled) if pulled else "-", im.get("Size", ""), im.get("UniqueSize", ""),
+                            im.get("Containers", "")))
+        return "\n".join(L) + "\n\n"
+
+    def g_disk(self):
+        while True:
+            summary = self.disk_summary()
+            if summary is None:
+                return
+            k = self.menu("Disk usage on %s" % self.host.label,
+                          [("d", "Detailed breakdown (per image / container / volume)"),
+                           ("o", "Prune images older than…"),
+                           ("x", "Other prune options…"),
+                           ("b", "Back")], note=summary)
+            if k in (None, "b"):
+                return
+            if k == "d":
+                out = self.capture(["docker", "system", "df", "-v"], timeout=120)
+                if out is not None:
+                    self.page(self.disk_images_table() + out[max(out.find("Containers space usage:"), 0):],
+                              "disk usage")
+            elif k == "o":
+                self.prune_old_images()
+            elif k == "x":
+                self.prune_menu()
+
+    def prune_old_images(self):
+        age = self.prompt("Remove unused images older than (e.g. 30d, 12h):", "30d")
+        if not age:
+            return
+        m = re.fullmatch(r"(\d+)\s*([dhm]?)", age.lower())
+        if not m:
+            return self.flash("Use a number followed by d, h or m, e.g. 30d", err=True)
+        hours = int(m.group(1)) * {"d": 24, "h": 1, "m": 1 / 60, "": 24}[m.group(2)]
+        by = self.menu("Measure age from",
+                       [("p", "Pull date: when it was pulled or tagged on this machine"),
+                        ("b", "Build date: when the image was built (CREATED in docker images)")],
+                       note="Untagged images with no pull date use their build date.", default=0)
+        if not by:
+            return
+        verb = "pulled" if by == "p" else "built"
+        k = self.menu("Prune images %s more than %s ago" % (verb, age),
+                      [("a", "All unused images (tagged or not)"),
+                       ("u", "Only untagged (dangling) images"),
+                       ("n", "Cancel")],
+                      note="Images used by any container (even a stopped one) are always kept.", default=0)
+        if k not in ("a", "u"):
+            return
+        # Not `docker image prune --filter until=`: what it compares depends on the image
+        # store (pull time with containerd, build time with the classic store).
+        rc, out, err = self.host.run(["docker", "image", "ls", "-a", "--no-trunc", "--format", "{{json .}}"])
+        if rc != 0:
+            return self.flash(err.strip() or "docker image ls failed", err=True)
+        sizes = {}
+        for im in json_lines(out):
+            sizes.setdefault(im.get("ID", ""), im.get("Size", "?"))
+        if not sizes:
+            return self.flash("No images.")
+        rc, out, err = self.host.run(["docker", "image", "inspect"] + list(sizes))
+        if rc != 0:
+            return self.flash(err.strip() or "docker image inspect failed", err=True)
+        images = json.loads(out or "[]")
+        used = set()
+        rc, cids, _ = self.host.run(["docker", "ps", "-aq", "--no-trunc"])
+        if cids.split():
+            rc, out, err = self.host.run(["docker", "inspect", "--format", "{{.Image}}"] + cids.split())
+            if rc != 0:
+                return self.flash(err.strip() or "docker inspect failed", err=True)
+            used = set(out.split())
+        cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+        doomed = []
+        for im in images:
+            built = parse_ts(im.get("Created", ""))
+            pulled = parse_ts((im.get("Metadata") or {}).get("LastTagTime", ""))
+            when = (pulled or built) if by == "p" else built
+            tags = [t for t in im.get("RepoTags") or [] if not t.endswith(":<none>")]
+            if im["Id"] in used or not when or when.timestamp() > cutoff or (k == "u" and tags):
+                continue
+            doomed.append((when, im["Id"], tags, built, pulled))
+        if not doomed:
+            return self.flash("No unused images %s more than %s ago." % (verb, age))
+        doomed.sort(key=lambda d: d[0])
+        fmt = "%-9s %-9s %-10s %-8s %s"
+        lines = ["Measured by %s date." % ("pull" if by == "p" else "build"), "",
+                 fmt % ("BUILT", "PULLED", "SIZE", "ID", "TAGS")]
+        lines += [fmt % (ago(b) if b else "-", ago(p) if p else "-", sizes.get(i, "?"), i.split(":")[-1][:8],
+                         ", ".join(t) or "<untagged>") for _, i, t, b, p in doomed]
+        self.page("\n".join(lines) + "\n", title="images to remove")
+        if self.confirm("Remove these %d image%s?" % (len(doomed), "s"[len(doomed) == 1:])):
+            refs = [r for _, i, t, _, _ in doomed for r in (t or [i])]
+            self.run_term(["docker", "rmi"] + refs)
+
+    def prune_menu(self):
+        options = {
+            "c": ("stopped containers", ["docker", "container", "prune", "-f"]),
+            "i": ("dangling (untagged) images", ["docker", "image", "prune", "-f"]),
+            "I": ("ALL images not used by a container", ["docker", "image", "prune", "-a", "-f"]),
+            "v": ("unused anonymous volumes", ["docker", "volume", "prune", "-f"]),
+            "V": ("ALL unused volumes, named ones too (data loss!)", ["docker", "volume", "prune", "-a", "-f"]),
+            "n": ("unused networks", ["docker", "network", "prune", "-f"]),
+            "b": ("build cache", ["docker", "builder", "prune", "-f"]),
+            "s": ("system: stopped containers, unused networks, dangling images, build cache",
+                  ["docker", "system", "prune", "-f"]),
+        }
+        items = [(key, "Remove " + lbl) for key, (lbl, _) in options.items()]
+        items.insert(3, ("o", "Remove unused images older than…"))
+        k = self.menu("Prune", items)
+        if k == "o":
+            self.prune_old_images()
+        elif k and self.confirm("Remove %s?" % options[k][0]):
+            self.run_term(options[k][1])
+
+    # ------------------------------------------------------------ misc globals
+    def g_filter(self):
+        f = self.prompt("Filter (name/image/project, blank clears):", self.filter)
+        if f is not None:
+            self.filter = f
+
+    def g_toggle_all(self):
+        self.show_all = not self.show_all
+
+    def g_refresh(self):
+        self.refresh_soon()
+        self.flash("Refreshing…")
+
+    def g_quit(self):
+        return False
+
+    def g_help(self):
+        def fmt(k, lbl):
+            return "  %-8s %s" % (k, lbl)
+        L = ["dockman %s — managing Docker on %s" % (VERSION, self.host.label), "",
+             "Moving:  Up/Down or j/k, PgUp/PgDn, Home/End or g/G.  Enter opens the action menu.", "",
+             "Container keys:"]
+        L += [fmt(a[0], a[1]) for a in CONTAINER_ACTIONS if a]
+        L += ["", "Everywhere:"] + [fmt(a[0], a[1]) for a in GLOBAL_ACTIONS]
+        L += ["", "Colours: green running, yellow paused/starting/busy, red unhealthy/restarting/failed,",
+              "dim stopped cleanly.", "",
+              "Restart policies and stopping:",
+              "  A manual 'docker stop' is never undone by the restart policy while the daemon keeps running.",
+              "  'always' containers do come back when the Docker daemon or the server restarts;",
+              "  'unless-stopped' ones stay stopped. X sets the policy to 'no' and stops, so the",
+              "  container stays down whatever happens. A container stuck in a restart loop is",
+              "  stopped with x too.", "",
+              "Disk space: D (or m → Disk usage) shows what Docker is using and offers pruning,",
+              "including removing images older than a chosen age that no container uses."]
+        self.page("\n".join(L) + "\n", "help")
+
+
+def wrap(text, width):
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    return lines + ([cur] if cur else [])
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Interactive manager for the Docker containers on this machine.")
+    ap.add_argument("--version", action="version", version="dockman " + VERSION)
+    ap.parse_args()
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.exit("dockman needs an interactive terminal.")
+    if not shutil.which("docker"):
+        sys.exit("The docker command was not found on this machine.")
+
+    host = Host()
+    rc, out, err = host.run(["docker", "version", "--format", "{{.Server.Version}}"])
+    if rc != 0:
+        msg = (err or out).strip()
+        hint = ""
+        if "permission denied" in msg.lower():
+            hint = "\nHint: add the user to the 'docker' group (sudo usermod -aG docker $USER) and log in again."
+        sys.exit("Cannot talk to Docker:\n%s%s" % (msg, hint))
+    compose = ["docker", "compose"]
+    if host.run(compose + ["version"])[0] != 0 and host.run(["docker-compose", "version"])[0] == 0:
+        compose = ["docker-compose"]
+
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(App(host, compose).run)
+
+
+if __name__ == "__main__":
+    main()
