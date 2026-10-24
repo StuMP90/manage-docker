@@ -100,6 +100,10 @@ def parse_container(d):
     hc = d.get("HostConfig") or {}
     labels = cfg.get("Labels") or {}
     rp = hc.get("RestartPolicy") or {}
+    swarm = labels.get("com.docker.swarm.service.name", "")
+    stack = labels.get("com.docker.stack.namespace", "")
+    # Swarm tasks can inherit compose labels baked into their image; they mean nothing here.
+    compose = {} if swarm else labels
 
     ports = []
     for cport, binds in sorted(((d.get("NetworkSettings") or {}).get("Ports") or {}).items()):
@@ -122,6 +126,8 @@ def parse_container(d):
     policy = rp.get("Name") or "no"
     if policy == "on-failure" and rp.get("MaximumRetryCount"):
         policy += ":%d" % rp["MaximumRetryCount"]
+    if swarm:
+        policy = "swarm"
 
     return {
         "id": d.get("Id", "")[:12],
@@ -135,10 +141,13 @@ def parse_container(d):
         "restart": policy,
         "restart_count": d.get("RestartCount", 0),
         "ports": ports,
-        "project": labels.get("com.docker.compose.project", ""),
-        "service": labels.get("com.docker.compose.service", ""),
-        "wd": labels.get("com.docker.compose.project.working_dir", ""),
-        "files": [f for f in labels.get("com.docker.compose.project.config_files", "").split(",") if f],
+        "project": compose.get("com.docker.compose.project", ""),
+        "service": compose.get("com.docker.compose.service", ""),
+        "wd": compose.get("com.docker.compose.project.working_dir", ""),
+        "files": [f for f in compose.get("com.docker.compose.project.config_files", "").split(",") if f],
+        "swarm": swarm,
+        "stack": stack,
+        "group": compose.get("com.docker.compose.project", "") or ("stack:" + stack if stack else "swarm" if swarm else ""),
         "raw": d,
     }
 
@@ -455,6 +464,7 @@ class App:
         self.scr = None
         self.draw_fn = self.draw_main
         self._home = None
+        self.swarm_prev = {}  # service -> replica count before we scaled it to 0
 
     # ---- background polling
     def poll_containers(self):
@@ -468,7 +478,7 @@ class App:
                 self.error = ((err or out).strip().splitlines() or ["docker ps failed"])[-1]
             else:
                 self.containers = sorted((parse_container(d) for d in data),
-                                         key=lambda c: (c["project"].lower(), c["name"].lower()))
+                                         key=lambda c: (c["group"].lower(), c["name"].lower()))
                 self.error = ""
                 self.loaded = True
             self.wake.wait(3)
@@ -526,6 +536,10 @@ class App:
     def suspended(self):
         """Leave curses temporarily to use the plain terminal."""
         curses.endwin()
+        # Some terminals (zSSH) keep the old TUI on the alternate screen, which less
+        # then draws over, so wipe both the alternate and the normal screen.
+        sys.stdout.write("\033[?1049h\033[H\033[2J\033[?1049l\033[H\033[2J")
+        sys.stdout.flush()
         try:
             yield
         finally:
@@ -551,7 +565,7 @@ class App:
                 pause()
                 return
             prompt = re.sub(r"([?:.%\\])", r"\\\1", (title + "  " if title else "") + "(q to return, / to search)")
-            env = dict(os.environ, LESS="-R", LESSSECURE="1")
+            env = dict(os.environ, LESS="-Rc", LESSSECURE="1")
             p = subprocess.Popen([less, "-Ps" + prompt] + (["+G"] if end else []),
                                  stdin=subprocess.PIPE, text=True, errors="replace", env=env)
             try:
@@ -740,7 +754,7 @@ class App:
         f = self.filter.lower()
         return [c for c in self.containers
                 if (self.show_all or c["state"] in ("running", "restarting", "paused"))
-                and (not f or f in ("%s %s %s" % (c["name"], c["image"], c["project"])).lower())]
+                and (not f or f in ("%s %s %s" % (c["name"], c["image"], c["group"])).lower())]
 
     def selected(self, view=None):
         view = self.view() if view is None else view
@@ -784,7 +798,7 @@ class App:
         self.put(0, w - len(clock), clock, curses.A_REVERSE)
 
         nw = min(max([len(c["name"]) for c in view] + [4]), 32)
-        pw = min(max([len(c["project"]) for c in view] + [7]), 18)
+        pw = min(max([len(c["group"]) for c in view] + [7]), 18)
         cols = [("NAME", nw), ("STATUS", 24), ("CPU", 7), ("MEM", 9), ("RESTART", 14),
                 ("PROJECT", pw), ("IMAGE", 32), ("PORTS", 0)]
 
@@ -801,7 +815,7 @@ class App:
         for i, c in enumerate(view[self.top:self.top + lh]):
             st = self.stats.get(c["id"], {}) if c["state"] == "running" else {}
             line = fmt([c["name"], self.busy.get(c["id"], c["status"]), st.get("CPUPerc", ""),
-                        st.get("MemUsage", "").split(" / ")[0], c["restart"], c["project"], c["image"],
+                        st.get("MemUsage", "").split(" / ")[0], c["restart"], c["group"], c["image"],
                         ", ".join(c["ports"])])
             attr = self.row_attr(c) | (curses.A_REVERSE if self.top + i == idx else 0)
             self.put(2 + i, 0, line.ljust(w), attr)
@@ -817,7 +831,10 @@ class App:
             d1 = " %s  %s  restarts: %s" % (cur["id"], cur["image"], cur["restart_count"])
             if cur["ports"]:
                 d1 += "  ports: " + ", ".join(cur["ports"])
-            if cur["project"]:
+            if cur["swarm"]:
+                d2 = " swarm service: %s%s   (stop/start/restart act on the service)" % (
+                    cur["swarm"], "  stack: " + cur["stack"] if cur["stack"] else "")
+            elif cur["project"]:
                 d2 = " compose: %s/%s  %s" % (cur["project"], cur["service"], cur["wd"])
             else:
                 st = self.stats.get(cur["id"], {})
@@ -884,6 +901,8 @@ class App:
 
     # ------------------------------------------------------- container actions
     def a_start(self, c):
+        if self.swarm_redirect(c):
+            return
         if c["state"] == "paused":
             self.bg(c, "unpause", ["docker", "unpause", c["name"]])
         elif c["state"] == "running":
@@ -892,6 +911,8 @@ class App:
             self.bg(c, "start", ["docker", "start", c["name"]])
 
     def a_stop(self, c):
+        if self.swarm_redirect(c):
+            return
         if c["state"] not in ("running", "restarting", "paused"):
             return self.flash("%s is not running" % c["name"])
         note = {
@@ -904,6 +925,8 @@ class App:
             self.bg(c, "stop", ["docker", "stop", c["name"]])
 
     def a_stop_hard(self, c):
+        if self.swarm_redirect(c):
+            return
         note = "Sets the restart policy to 'no' and stops it, so nothing brings it back automatically."
         if c["project"]:
             note += "\nNote: compose re-applies its own policy on the next 'up' of project %s." % c["project"]
@@ -915,6 +938,8 @@ class App:
         self.bg(c, "stop (no restart)", script)
 
     def a_restart(self, c):
+        if self.swarm_redirect(c):
+            return
         if self.confirm("Restart %s?" % c["name"]):
             self.bg(c, "restart", ["docker", "restart", c["name"]])
 
@@ -927,12 +952,16 @@ class App:
             self.flash("%s is not running" % c["name"], err=True)
 
     def a_kill(self, c):
+        if self.swarm_redirect(c):
+            return
         if c["state"] not in ("running", "restarting", "paused"):
             return self.flash("%s is not running" % c["name"])
         if self.confirm("Kill %s (SIGKILL, no clean shutdown)?" % c["name"]):
             self.bg(c, "kill", ["docker", "kill", c["name"]])
 
     def a_remove(self, c):
+        if self.swarm_redirect(c):
+            return
         note = ""
         if c["state"] in ("running", "restarting", "paused"):
             note = "It is running and will be force-stopped first. "
@@ -1004,6 +1033,8 @@ class App:
              "Restart:     policy=%s   restart count=%s" % (c["restart"], c["restart_count"])]
         if st.get("Error"):
             L.append("Error:       %s" % st["Error"])
+        if c["swarm"]:
+            L.append("Swarm:       service=%s%s" % (c["swarm"], "  stack=" + c["stack"] if c["stack"] else ""))
         if c["project"]:
             L += ["Compose:     project=%s service=%s" % (c["project"], c["service"]),
                   "             dir=%s" % c["wd"], "             files=%s" % ", ".join(c["files"])]
@@ -1051,6 +1082,8 @@ class App:
         self.run_term(["docker", "stats", c["name"]], wait=False, note="Ctrl-C to return")
 
     def a_policy(self, c):
+        if self.swarm_redirect(c):
+            return
         k = self.menu("Restart policy for %s (now: %s)" % (c["name"], c["restart"]),
                       [("u", "unless-stopped  (restart unless you stopped it)"),
                        ("a", "always          (restart, even after a manual stop + reboot)"),
@@ -1069,6 +1102,8 @@ class App:
         self.bg(c, "set restart=%s" % pol, ["docker", "update", "--restart", pol, c["name"]])
 
     def a_rename(self, c):
+        if self.swarm_redirect(c):
+            return
         new = self.prompt("New name for %s:" % c["name"], c["name"])
         if new and new != c["name"]:
             self.bg(c, "rename", ["docker", "rename", c["name"], new])
@@ -1090,6 +1125,8 @@ class App:
         self.page(text, "export %s" % c["name"])
 
     def a_update(self, c):
+        if self.swarm_redirect(c):
+            return
         if not c["project"]:
             return self.flash("Only compose containers can be recreated safely; use E to export it to compose.",
                               err=True)
@@ -1100,9 +1137,113 @@ class App:
                           shlex.join(self.compose_cmd(p, "up", "-d", *svc)))
 
     def a_compose_sel(self, c):
+        if self.swarm_redirect(c):
+            return
         if not c["project"]:
             return self.flash("%s is not part of a compose project" % c["name"], err=True)
         self.compose_menu(self.project_from(c))
+
+    # ------------------------------------------------------------------ swarm
+    def swarm_redirect(self, c):
+        """Swarm replaces any task container that stops, so act on its service instead."""
+        if not c["swarm"]:
+            return False
+        self.swarm_menu(c["swarm"], c["stack"])
+        return True
+
+    def swarm_services(self):
+        out = self.capture(["docker", "service", "ls", "--format", "{{json .}}"])
+        return None if out is None else json_lines(out)
+
+    def swarm_menu(self, svc, stack=""):
+        while True:
+            services = self.swarm_services()
+            if services is None:
+                return
+            info = next((s for s in services if s.get("Name") == svc), None)
+            if info is None:
+                return self.flash("Swarm service %s no longer exists" % svc, err=True)
+            replicated = info.get("Mode") == "replicated"
+            note = ("%s is a Docker Swarm service (%s, %s running). Swarm replaces any task container "
+                    "that stops, whatever its restart policy, so stopping and starting act on the service."
+                    % (svc, info.get("Mode"), info.get("Replicas")))
+            items = []
+            if replicated:
+                items += [("z", "Stop: scale to 0 (stays stopped)"), ("s", "Start / scale to N replicas…")]
+            items += [("r", "Restart all tasks (rolling)"), None,
+                      ("l", "Service logs (last 5000 lines)"), ("f", "Follow service logs live"),
+                      ("p", "Tasks (service ps)"), ("i", "Inspect service"), None,
+                      ("d", "Remove service…")]
+            if stack:
+                items.append(("D", "Remove whole stack %s…" % stack))
+            k = self.menu("Swarm service %s" % svc, items, note=note)
+            if k is None:
+                return
+            if k == "z":
+                if self.confirm("Scale %s to 0?" % svc, "All its tasks stop and stay stopped until you scale it up "
+                                                        "again (s), here or with 'docker service scale'."):
+                    self.swarm_prev[svc] = info.get("Replicas", "").partition("/")[2] or "1"
+                    self.run_term(["docker", "service", "scale", "%s=0" % svc])
+            elif k == "s":
+                cur = info.get("Replicas", "").partition("/")[2]
+                n = self.prompt("Replicas for %s:" % svc,
+                                self.swarm_prev.get(svc) or (cur if cur not in ("", "0") else "1"))
+                if n is None:
+                    continue
+                if not n.isdigit():
+                    self.flash("Not a number: %s" % n, err=True)
+                    continue
+                self.run_term(["docker", "service", "scale", "%s=%s" % (svc, n)])
+            elif k == "r":
+                if self.confirm("Restart all tasks of %s?" % svc, "Swarm replaces them one by one "
+                                                                  "(docker service update --force)."):
+                    self.run_term(["docker", "service", "update", "--force", svc])
+            elif k == "l":
+                out = self.capture(["docker", "service", "logs", "--tail", "5000", svc], timeout=120)
+                if out is not None:
+                    self.page(out or "(no logs)", "logs %s" % svc, end=True)
+            elif k == "f":
+                self.run_term(["docker", "service", "logs", "-f", "--tail", "100", svc], wait=False,
+                              note="Ctrl-C to return")
+            elif k == "p":
+                out = self.capture(["docker", "service", "ps", "--no-trunc", svc])
+                if out is not None:
+                    self.page(out, "tasks of %s" % svc)
+            elif k == "i":
+                out = self.capture(["docker", "service", "inspect", "--pretty", svc])
+                if out is not None:
+                    self.page(out, "service %s" % svc)
+            elif k == "d":
+                if self.confirm("Remove swarm service %s?" % svc, "Swarm removes all its tasks. To get it back you "
+                                                                  "have to redeploy it (e.g. docker stack deploy)."):
+                    if self.capture(["docker", "service", "rm", svc]) is not None:
+                        self.flash("Removed service " + svc)
+                    self.refresh_soon()
+                    return
+            elif k == "D":
+                if self.confirm("Remove the whole stack %s?" % stack, "Removes all its services, tasks and "
+                                                                      "networks (docker stack rm). Volumes are kept."):
+                    if self.capture(["docker", "stack", "rm", stack]) is not None:
+                        self.flash("Removed stack " + stack)
+                    self.refresh_soon()
+                    return
+            self.refresh_soon()
+
+    def services_screen(self):
+        while True:
+            services = self.swarm_services()
+            if services is None:
+                return
+            rows = ["%-36s %-11s %-9s %s" % (trunc(s.get("Name", ""), 36), s.get("Mode", ""), s.get("Replicas", ""),
+                                             s.get("Image", "")) for s in services]
+            k, i = self.pick("Swarm services", "%-36s %-11s %-9s %s" % ("NAME", "MODE", "REPLICAS", "IMAGE"), rows,
+                             "Enter actions  q back")
+            if k is None:
+                return
+            if k == "\n" and i is not None:
+                name = services[i].get("Name", "")
+                stack = next((c["stack"] for c in self.containers if c["swarm"] == name), "")
+                self.swarm_menu(name, stack)
 
     # ---------------------------------------------------------------- compose
     def project_from(self, c):
@@ -1431,7 +1572,7 @@ class App:
     def g_manage(self):
         while True:
             k = self.menu("Manage %s" % self.host.label,
-                          [("i", "Images"), ("v", "Volumes"), ("n", "Networks"), None,
+                          [("i", "Images"), ("v", "Volumes"), ("n", "Networks"), ("w", "Swarm services"), None,
                            ("e", "Recent events (last hour)"), ("D", "Disk usage"),
                            ("x", "Prune unused things…"), ("I", "Docker / server info")])
             if k is None:
@@ -1442,6 +1583,8 @@ class App:
                 self.volumes_screen()
             elif k == "n":
                 self.networks_screen()
+            elif k == "w":
+                self.services_screen()
             elif k == "e":
                 out = self.capture('docker events --since 1h --until "$(date +%s)"', timeout=60)
                 if out is not None:
@@ -1755,6 +1898,10 @@ class App:
               "  'unless-stopped' ones stay stopped. X sets the policy to 'no' and stops, so the",
               "  container stays down whatever happens. A container stuck in a restart loop is",
               "  stopped with x too.", "",
+              "Swarm: containers run by a Swarm service (RESTART shows 'swarm') are replaced by Swarm",
+              "  whenever they stop, whatever their restart policy. For those, s/x/X/r/K/d open the",
+              "  service menu instead: scale to 0 to stop it for good, scale up to start, rolling restart,",
+              "  remove the service or its stack. m → Swarm services lists all services.", "",
               "Disk space: D (or m → Disk usage) shows what Docker is using and offers pruning,",
               "including removing images older than a chosen age that no container uses."]
         self.page("\n".join(L) + "\n", "help")

@@ -52,7 +52,7 @@ or use these keys directly:
 | `a` | add: guided `docker run`, paste a `docker run` command, new compose project, or start an existing compose file |
 | `P` | compose projects: up, pull and update, start, stop, restart, down, logs, ps, config, edit the file |
 | `D` | disk usage and pruning |
-| `m` | images, volumes, networks, events, disk usage, prune, docker info |
+| `m` | images, volumes, networks, Swarm services, events, disk usage, prune, docker info |
 | `/` / `A` / `R` | filter / toggle all or running-only containers / refresh |
 | `?` / `q` | help / quit |
 
@@ -65,6 +65,20 @@ or the server restarts.
 `X` changes the policy to `no` and then stops the container, so it stays down whatever
 happens. Turn the policy back on later with `u`. Compose containers get their own policy
 back the next time their project is brought `up`.
+
+## Swarm services
+
+Containers run by a Docker Swarm service (for example from `docker stack deploy`) show
+`swarm` in the RESTART column and `stack:<name>` as their project. Swarm replaces any such
+container that stops, whatever its restart policy, so stopping the container alone never
+sticks. For these containers, `s`, `x`, `X`, `r`, `K` and `d` open a menu for the service
+instead:
+- stop it by scaling to 0 replicas (it stays stopped), or start it by scaling up again;
+- restart all its tasks (rolling);
+- view or follow the service logs, list its tasks, or inspect it;
+- remove the service, or the whole stack.
+
+`m` → Swarm services lists every service. These actions need a Swarm manager node.
 
 ## Adding containers
 
